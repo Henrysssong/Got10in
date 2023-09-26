@@ -7,27 +7,31 @@ from authlib.integrations.starlette_client import OAuth
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 from starlette.responses import RedirectResponse
-from fastapi.routing import APIRoute as Route
-from starlette.routing import Mount, Router, Route as StarletteRoute
-from starlette.routing import request_response
 import httpx
+import bcrypt
 from pymongo.errors import DuplicateKeyError
 from dotenv import load_dotenv
 from config import MONGODB_URL, DATABASE_NAME, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
+from config import OPENAI_API_KEY
 
 load_dotenv()
 
 app = FastAPI()
+
+# Constants for OpenAI
+OPENAI_URL = "https://api.openai.com/v2/engines/davinci-codex/completions"
+HEADERS = {
+    "Authorization": f"Bearer {OPENAI_API_KEY}",
+    "Content-Type": "application/json",
+    "User-Agent": "OpenAI-FastAPI-Integration",
+}
 
 # Database configurations
 client = AsyncIOMotorClient(MONGODB_URL)
 db = client[DATABASE_NAME]
 
 # CORS setup
-origins = [
-    "http://localhost:3000",   # React's default port
-]
-
+origins = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -52,7 +56,7 @@ oauth.register(
 
 @app.get('/login')
 async def login(request: Request):
-    redirect_uri = "http://localhost:8000/login/callback"  # Manually constructing the URL
+    redirect_uri = "http://localhost:8000/login/callback"
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 @app.get('/login/callback')
@@ -60,7 +64,7 @@ async def callback(request: Request):
     token = await oauth.google.authorize_access_token(request)
     user = await oauth.google.parse_id_token(request, token)
     request.session['user'] = dict(user)
-    return RedirectResponse("/profile")  # Manually constructing the URL
+    return RedirectResponse("/profile")
 
 @app.route('/profile')
 async def profile(request: Request):
@@ -68,6 +72,35 @@ async def profile(request: Request):
     if not user:
         raise HTTPException(status_code=401)
     return user
+
+@app.post("/register/")
+async def register(email: str, password: str):
+    hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    
+    # Check for duplicate email
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Store the hashed_pw in the database along with the user's email
+    user_data = {"email": email, "password": hashed_pw}
+    result = await db.users.insert_one(user_data)
+    
+    if not result:
+        raise HTTPException(status_code=500, detail="Registration failed")
+    
+    return {"message": "User registered successfully"}
+
+@app.post("/login-email/")
+async def login_email(email: str, password: str):
+    user = await db.users.find_one({"email": email})
+
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    if not bcrypt.checkpw(password.encode('utf-8'), user["password"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    return {"message": "Login successful"}
 
 @app.get("/")
 def read_root():
@@ -79,7 +112,7 @@ async def submit_response(response: Questionnaire):
         raise HTTPException(status_code=400, detail="Invalid response")
     
     # Save to MongoDB 
-    result = await db.responses.insert_one(response.model_dump())
+    result = await db.responses.insert_one(response.dict())
 
     if not result:
         raise HTTPException(status_code=500, detail="Failed to save response")
@@ -88,24 +121,16 @@ async def submit_response(response: Questionnaire):
 
 @app.post("/get-college-rankings/")
 async def get_college_rankings(response: Questionnaire):
-    # Use the OpenAI API to get the rankings based on the user's preferences
-    url = "https://api.openai.com/v2/engines/davinci-codex/completions"
-    YOUR_OPENAI_API_KEY = "Your OpenAI Key Here"
-    headers = {
-        "Authorization": f"Bearer {YOUR_OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "OpenAI-FastAPI-Integration",
-    }
-    
+    # Construct the prompt for OpenAI
     prompt_text = f"Given that a student prefers a {response.preference} university and wants to major in {response.major}, what are the top 10 college recommendations?"
     
     payload = {
         "prompt": prompt_text,
-        "max_tokens": 150  # adjust as needed
+        "max_tokens": 150
     }
     
     async with httpx.AsyncClient() as client:
-        api_response = await client.post(url, headers=headers, json=payload)
+        api_response = await client.post(OPENAI_URL, headers=HEADERS, json=payload)
     
     response_data = api_response.json()
     return {"rankings": response_data["choices"][0]["text"].strip()}
