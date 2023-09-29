@@ -13,6 +13,7 @@ from pymongo.errors import DuplicateKeyError
 from dotenv import load_dotenv
 from config import MONGODB_URL, DATABASE_NAME, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI
 from config import OPENAI_API_KEY
+import os
 
 load_dotenv()
 
@@ -30,7 +31,7 @@ HEADERS = {
 client = AsyncIOMotorClient(MONGODB_URL)
 db = client[DATABASE_NAME]
 
-# CORS setup
+# CORS setup for development
 origins = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
@@ -39,17 +40,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(SessionMiddleware, secret_key="some-random-secret-key", max_age=3600)
 
+# Secure session middleware setup
+SECRET_KEY = os.getenv("SESSION_SECRET_KEY", "some-random-secret-key")  # Get from environment variable
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=3600)
+
+# OAuth setup
 oauth = OAuth()
 oauth.register(
     name='google',
     client_id=GOOGLE_CLIENT_ID,
     client_secret=GOOGLE_CLIENT_SECRET,
     authorize_url='https://accounts.google.com/o/oauth2/auth',
-    authorize_params=None,
     access_token_url='https://accounts.google.com/o/oauth2/token',
-    refresh_token_url=None,
     redirect_uri=GOOGLE_REDIRECT_URI,
     client_kwargs={'scope': 'openid profile email'},
 )
@@ -77,16 +80,12 @@ async def profile(request: Request):
 async def register(email: str, password: str):
     hashed_pw = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
     
-    # Check for duplicate email
-    if await db.users.find_one({"email": email}):
-        raise HTTPException(status_code=400, detail="Email already registered")
-    
     # Store the hashed_pw in the database along with the user's email
     user_data = {"email": email, "password": hashed_pw}
-    result = await db.users.insert_one(user_data)
-    
-    if not result:
-        raise HTTPException(status_code=500, detail="Registration failed")
+    try:
+        await db.users.insert_one(user_data)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=400, detail="Email already registered")
     
     return {"message": "User registered successfully"}
 
@@ -94,10 +93,7 @@ async def register(email: str, password: str):
 async def login_email(email: str, password: str):
     user = await db.users.find_one({"email": email})
 
-    if not user:
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
-
-    if not bcrypt.checkpw(password.encode('utf-8'), user["password"]):
+    if not user or not bcrypt.checkpw(password.encode('utf-8'), user["password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
     
     return {"message": "Login successful"}
@@ -133,4 +129,9 @@ async def get_college_rankings(response: Questionnaire):
         api_response = await client.post(OPENAI_URL, headers=HEADERS, json=payload)
     
     response_data = api_response.json()
-    return {"rankings": response_data["choices"][0]["text"].strip()}
+    # Ensure the response is as expected
+    rankings = response_data.get("choices", [{}])[0].get("text", "").strip()
+    if not rankings:
+        raise HTTPException(status_code=500, detail="Failed to get rankings from OpenAI")
+    
+    return {"rankings": rankings}
